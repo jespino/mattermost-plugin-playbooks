@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -492,7 +493,7 @@ func (h *PlaybookRunHandler) createPlaybookRun(playbookRun app.PlaybookRun, user
 		if channel.Type == model.ChannelTypePrivate {
 			permission = model.PermissionManagePrivateChannelProperties
 			permissionMessage = "You are not able to manage private channel properties"
-		} else if channel.Type == model.ChannelTypeDirect || channel.Type == model.ChannelTypeGroup {
+		} else if channel.IsGroupOrDirect() {
 			permission = model.PermissionReadChannel
 			permissionMessage = "You do not have access to this channel"
 		}
@@ -680,12 +681,12 @@ func (h *PlaybookRunHandler) getChannels(c *Context, w http.ResponseWriter, r *h
 		return
 	}
 
-	channelIds := make([]string, 0, len(playbookRuns.Items))
+	channelIDs := make([]string, 0, len(playbookRuns.Items))
 	for _, playbookRun := range playbookRuns.Items {
-		channelIds = append(channelIds, playbookRun.ChannelID)
+		channelIDs = append(channelIDs, playbookRun.ChannelID)
 	}
 
-	ReturnJSON(w, channelIds, http.StatusOK)
+	ReturnJSON(w, channelIDs, http.StatusOK)
 }
 
 // changeOwner handles the /runs/{id}/change-owner api endpoint.
@@ -1310,6 +1311,12 @@ func (h *PlaybookRunHandler) itemRun(c *Context, w http.ResponseWriter, r *http.
 		return
 	}
 	userID := r.Header.Get("Mattermost-User-ID")
+
+	// Check the body is empty
+	if _, err := r.Body.Read(make([]byte, 1)); err != io.EOF {
+		h.HandleErrorWithCode(w, c.logger, http.StatusBadRequest, "request body must be empty", nil)
+		return
+	}
 
 	triggerID, err := h.playbookRunService.RunChecklistItemSlashCommand(playbookRunID, userID, checklistNum, itemNum)
 	if err != nil {

@@ -156,13 +156,15 @@ func NewPlaybookRunStore(pluginAPI PluginAPIClient, sqlStore *SQLStore) app.Play
 	// the user is not a member of the channel they won't have permissions to get the user list
 	participantsCol := `
         COALESCE(
-			(SELECT string_agg(rp.UserId, ',')
+			(SELECT string_agg(x.UserId, ',') FROM (
+				SELECT rp.UserId
 				FROM IR_Incident as i2
 					JOIN IR_Run_Participants as rp on rp.IncidentID = i2.ID
+					LEFT JOIN Bots b ON (b.UserId = rp.UserId)
 				WHERE i2.Id = i.Id
 				AND rp.IsParticipant = true
-				AND rp.UserId NOT IN (SELECT UserId FROM Bots)
-			), ''
+				ORDER BY (CASE WHEN b.UserId IS NULL THEN 0 ELSE 1 END), rp.UserId
+			) x), ''
         ) AS ConcatenatedParticipantIDs`
 	if sqlStore.db.DriverName() == model.DatabaseDriverMysql {
 		participantsCol = `
@@ -170,9 +172,10 @@ func NewPlaybookRunStore(pluginAPI PluginAPIClient, sqlStore *SQLStore) app.Play
 			(SELECT group_concat(rp.UserId separator ',')
 				FROM IR_Incident as i2
 					JOIN IR_Run_Participants as rp on rp.IncidentID = i2.ID
+					LEFT JOIN Bots b ON (b.UserId = rp.UserId)
 				WHERE i2.Id = i.Id
 				AND rp.IsParticipant = true
-				AND rp.UserId NOT IN (SELECT UserId FROM Bots)
+				ORDER BY (CASE WHEN b.UserId IS NULL THEN 0 ELSE 1 END), rp.UserId
 			), ''
         ) AS ConcatenatedParticipantIDs`
 	}
@@ -802,12 +805,12 @@ func (s *playbookRunStore) GetMetricsByIDs(playbookRunIDs []string) (map[string]
 		return nil, err
 	}
 
-	metricsByIds := make(map[string][]app.RunMetricData)
+	metricsByIDs := make(map[string][]app.RunMetricData)
 	for _, metric := range metrics {
-		metricsByIds[metric.IncidentID] = append(metricsByIds[metric.IncidentID], app.RunMetricData{MetricConfigID: metric.MetricConfigID, Value: metric.Value})
+		metricsByIDs[metric.IncidentID] = append(metricsByIDs[metric.IncidentID], app.RunMetricData{MetricConfigID: metric.MetricConfigID, Value: metric.Value})
 	}
 
-	return metricsByIds, nil
+	return metricsByIDs, nil
 }
 
 func (s *playbookRunStore) getStatusPostsForPlaybookRun(q sqlx.Queryer, playbookRunIDs []string) (playbookRunStatusPosts, error) {
@@ -891,13 +894,12 @@ func (s *playbookRunStore) GetPlaybookRunIDsForChannel(channelID string) ([]stri
 }
 
 // GetHistoricalPlaybookRunParticipantsCount returns the count of all members of a playbook run's channel
-// since the beginning of the playbook run, excluding bots.
+// since the beginning of the playbook run.
 func (s *playbookRunStore) GetHistoricalPlaybookRunParticipantsCount(channelID string) (int64, error) {
 	query := s.queryBuilder.
 		Select("COUNT(DISTINCT cmh.UserId)").
 		From("ChannelMemberHistory AS cmh").
-		Where(sq.Eq{"cmh.ChannelId": channelID}).
-		Where(sq.Expr("cmh.UserId NOT IN (SELECT UserId FROM Bots)"))
+		Where(sq.Eq{"cmh.ChannelId": channelID})
 
 	var numParticipants int64
 	err := s.store.getBuilder(s.store.db, &numParticipants, query)
@@ -1380,8 +1382,7 @@ func (s *playbookRunStore) GetParticipantsActiveTotal() (int64, error) {
 		From("IR_Run_Participants as rp").
 		Join("IR_Incident AS i ON i.ID = rp.IncidentID").
 		Where(sq.Eq{"i.CurrentStatus": app.StatusInProgress}).
-		Where(sq.Eq{"rp.IsParticipant": true}).
-		Where(sq.Expr("rp.UserId NOT IN (SELECT UserId FROM Bots)"))
+		Where(sq.Eq{"rp.IsParticipant": true})
 
 	if err := s.store.getBuilder(s.store.db, &count, query); err != nil {
 		return 0, errors.Wrap(err, "failed to count active participants")
@@ -1533,107 +1534,6 @@ func (s *playbookRunStore) GetPlaybookRunIDsForUser(userID string) ([]string, er
 		return nil, errors.Wrap(err, "failed to query for playbook runs")
 	}
 	return ids, nil
-}
-
-// GetRunMetadataByIDs returns playbook runs metadata by passed run IDs.
-func (s *playbookRunStore) GetRunMetadataByIDs(runIDs []string) ([]app.RunMetadata, error) {
-	var runs []app.RunMetadata
-	query := s.store.builder.
-		Select("ID", "TeamID", "Name").
-		From("IR_Incident").
-		Where(sq.Eq{"ID": runIDs})
-	if err := s.store.selectBuilder(s.store.db, &runs, query); err != nil {
-		return nil, errors.Wrap(err, "failed to query playbook run by runIDs")
-	}
-
-	runsMap := make(map[string]app.RunMetadata, len(runs))
-	for _, run := range runs {
-		runsMap[run.ID] = run
-	}
-	orderedRuns := make([]app.RunMetadata, len(runIDs))
-	for i, runID := range runIDs {
-		orderedRuns[i] = runsMap[runID]
-	}
-	return orderedRuns, nil
-}
-
-// GetTaskAsTopicMetadataByIDs gets PlaybookRunIDs and TeamIDs from runs by taskIDs
-func (s *playbookRunStore) GetTaskAsTopicMetadataByIDs(taskIDs []string) ([]app.TopicMetadata, error) {
-	tasksMap := make(map[string]app.TopicMetadata, len(taskIDs))
-	for _, taskID := range taskIDs {
-		var runsInDB []struct {
-			app.TopicMetadata
-			ChecklistsJSON json.RawMessage
-		}
-		query := s.store.builder.
-			Select("ID AS RunID", "TeamID", "ChecklistsJSON").
-			From("IR_Incident")
-
-		if s.store.db.DriverName() == model.DatabaseDriverMysql {
-			query = query.Where(sq.Like{"ChecklistsJSON": fmt.Sprintf("%%\"%s\"%%", taskID)})
-		} else {
-			query = query.Where(sq.Like{"ChecklistsJSON::text": fmt.Sprintf("%%\"%s\"%%", taskID)})
-		}
-
-		if err := s.store.selectBuilder(s.store.db, &runsInDB, query); err != nil {
-			return nil, errors.Wrapf(err, "failed to query playbook run by taskID - %s", taskID)
-		}
-
-		for _, run := range runsInDB {
-			var checklists []app.Checklist
-			err := json.Unmarshal(run.ChecklistsJSON, &checklists)
-			if err != nil {
-				return nil, errors.Wrapf(err, "failed to unmarshal checklists json for playbook run id: %s", run.RunID)
-			}
-
-			if isTaskInChecklists(checklists, taskID) {
-				tasksMap[taskID] = app.TopicMetadata{
-					ID:     taskID,
-					RunID:  run.RunID,
-					TeamID: run.TeamID,
-				}
-			}
-		}
-	}
-	tasks := make([]app.TopicMetadata, len(taskIDs))
-	for i, taskID := range taskIDs {
-		tasks[i] = tasksMap[taskID]
-	}
-
-	return tasks, nil
-}
-
-func isTaskInChecklists(checklists []app.Checklist, taskID string) bool {
-	for _, checklist := range checklists {
-		for _, item := range checklist.Items {
-			if item.ID == taskID {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// GetStatusAsTopicMetadataByIDs gets PlaybookRunIDs and TeamIDs from runs by statusIDs
-func (s *playbookRunStore) GetStatusAsTopicMetadataByIDs(statusIDs []string) ([]app.TopicMetadata, error) {
-	var statuses []app.TopicMetadata
-	query := s.store.builder.
-		Select("sp.PostID AS ID", "sp.IncidentID AS RunID", "i.TeamID AS TeamID").
-		From("IR_StatusPosts as sp").
-		Join("IR_Incident as i ON sp.IncidentID = i.ID").
-		Where(sq.Eq{"sp.PostID": statusIDs})
-	if err := s.store.selectBuilder(s.store.db, &statuses, query); err != nil {
-		return nil, errors.Wrap(err, "failed to query playbook runs by statusIDs")
-	}
-	statusesMap := make(map[string]app.TopicMetadata, len(statuses))
-	for _, status := range statuses {
-		statusesMap[status.ID] = status
-	}
-	orderedStatuses := make([]app.TopicMetadata, len(statusIDs))
-	for i, statusID := range statusIDs {
-		orderedStatuses[i] = statusesMap[statusID]
-	}
-	return orderedStatuses, nil
 }
 
 func (s *playbookRunStore) GraphqlUpdate(id string, setmap map[string]interface{}) error {

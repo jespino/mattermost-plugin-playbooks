@@ -101,12 +101,23 @@ const Wrapper = styled.div`
         margin-bottom: 6px;
     }
 
+    && .textarea-wrapper-preview  {
+        .custom-textarea.custom-textarea.textbox-preview-area {
+            display: block!important;
+            z-index: 0;
+        }
+        .input-wrapper {
+            display: none;
+        }
+    }
+
     && {
         .custom-textarea.custom-textarea {
             background-color: var(--center-channel-bg);;
 
             &.textbox-preview-area {
                 background-color: rgba(var(--center-channel-color-rgb), 0.04);
+                display: none!important;
             }
 
             height: unset;

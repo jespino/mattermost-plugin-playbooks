@@ -51,11 +51,11 @@ func (r *RunRootResolver) Runs(ctx context.Context, args struct {
 	}
 	userID := c.r.Header.Get("Mattermost-User-ID")
 
-	requesterInfo := app.RequesterInfo{
-		UserID:  userID,
-		TeamID:  args.TeamID,
-		IsAdmin: app.IsSystemAdmin(userID, c.pluginAPI),
+	requesterInfo, err := app.GetRequesterInfo(userID, c.pluginAPI)
+	if err != nil {
+		return nil, err
 	}
+	requesterInfo.TeamID = args.TeamID
 
 	if args.ParticipantOrFollowerID == client.Me {
 		args.ParticipantOrFollowerID = userID
@@ -179,11 +179,36 @@ func (r *RunRootResolver) UpdateRun(ctx context.Context, args struct {
 	setmap := map[string]interface{}{}
 	addToSetmap(setmap, "Name", args.Updates.Name)
 	addToSetmap(setmap, "Description", args.Updates.Summary)
-	addToSetmap(setmap, "ChannelID", args.Updates.ChannelID)
 	addToSetmap(setmap, "CreateChannelMemberOnNewParticipant", args.Updates.CreateChannelMemberOnNewParticipant)
 	addToSetmap(setmap, "RemoveChannelMemberOnRemovedParticipant", args.Updates.RemoveChannelMemberOnRemovedParticipant)
 	addToSetmap(setmap, "StatusUpdateBroadcastChannelsEnabled", args.Updates.StatusUpdateBroadcastChannelsEnabled)
 	addToSetmap(setmap, "StatusUpdateBroadcastWebhooksEnabled", args.Updates.StatusUpdateBroadcastWebhooksEnabled)
+
+	if args.Updates.ChannelID != nil {
+		channel, err := c.pluginAPI.Channel.Get(*args.Updates.ChannelID)
+		if err != nil {
+			return "", errors.Wrapf(err, "failed to get channel")
+		}
+
+		if channel.TeamId != playbookRun.TeamID {
+			return "", errors.Wrap(app.ErrMalformedPlaybookRun, "channel not in given team")
+		}
+
+		permission := model.PermissionManagePublicChannelProperties
+		permissionMessage := "You are not able to manage public channel properties"
+		if channel.Type == model.ChannelTypePrivate {
+			permission = model.PermissionManagePrivateChannelProperties
+			permissionMessage = "You are not able to manage private channel properties"
+		} else if channel.IsGroupOrDirect() {
+			permission = model.PermissionReadChannel
+			permissionMessage = "You do not have access to this channel"
+		}
+
+		if !c.pluginAPI.User.HasPermissionToChannel(userID, channel.Id, permission) {
+			return "", errors.Wrap(app.ErrNoPermissions, permissionMessage)
+		}
+		addToSetmap(setmap, "ChannelID", args.Updates.ChannelID)
+	}
 
 	if args.Updates.Summary != nil {
 		addToSetmap(setmap, "SummaryModifiedAt", &now)

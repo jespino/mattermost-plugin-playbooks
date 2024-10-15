@@ -335,6 +335,12 @@ func TestCreateRunInExistingChannel(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, run)
 		assert.Equal(t, e.BasicPublicChannel.Id, run.ChannelID)
+
+		// Verify user was not promoted to admin
+		member, _, err := e.ServerAdminClient.GetChannelMember(e.BasicPublicChannel.Id, e.RegularUser.Id, "")
+		require.NoError(t, err)
+		assert.NotContains(t, member.Roles, model.ChannelAdminRoleId)
+
 	})
 
 	t.Run("no access to the linked channel", func(t *testing.T) {
@@ -1712,6 +1718,12 @@ func TestChecklisItem_SetCommand(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, "/playbook todo", run.Checklists[0].Items[0].Command)
 		require.NotZero(t, run.Checklists[0].Items[0].CommandLastRun)
+	})
+
+	t.Run("can't run if not member", func(t *testing.T) {
+		// run command
+		err = e.PlaybooksClient2.PlaybookRuns.RunItemCommand(context.Background(), run.ID, 0, 0)
+		require.Error(t, err)
 	})
 
 	t.Run("rerun command", func(t *testing.T) {
